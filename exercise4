@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+
+# to run:
+# In your VM
+# cd labs/lab1/Labsetup/volumes
+# nano arp_poisoning.py
+# docksh <attacker_container_id>
+# cd /volumes
+# python3 arp_poisoning.py mitm
+
 from scapy.all import *
 import time
 import sys
